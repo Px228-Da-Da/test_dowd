@@ -1,53 +1,78 @@
-use std::fs;
-// use std::path::Path;
+//! Library scanning and song-lyrics retrieval.
+//!
+//! Two unrelated responsibilities live here, both I/O-heavy and run off the UI
+//! thread:
+//!
+//! * **Scanning** ([`scan_music`]): turn a music folder into [`Playlist`]s —
+//!   each subfolder with MP3s becomes a playlist, and loose MP3s in the root
+//!   become an "all tracks" playlist.
+//! * **Lyrics** ([`get_synced_lyrics`], [`fetch_lyrics_from_internet`]): find
+//!   time-synced ("karaoke") lyrics, first from the file's own ID3 tags, then
+//!   from online providers (lrclib, then NetEase).
+
+use id3::{Tag, TagLike};
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use std::fs;
 
+/// A named group of track file paths.
 #[derive(Clone)]
 pub struct Playlist {
     pub name: String,
     pub songs: Vec<String>,
 }
 
+/// Scans `root` and builds playlists from its contents.
+///
+/// Layout rules:
+/// * Each immediate subfolder containing `.mp3` files becomes a playlist named
+///   after the folder.
+/// * Loose `.mp3` files directly in `root` are grouped into a single
+///   "Усі треки" (all tracks) playlist.
+///
+/// Returns an empty vector (after logging) if `root` is missing or has no MP3s.
 pub fn scan_music(root: &str) -> Vec<Playlist> {
     let mut playlists = vec![];
-    
-    println!("🔍 Сканування папки з музикою: {}", root);
+
+    println!("🔍 Scanning music folder: {}", root);
 
     let mut root_songs = vec![];
 
-    if let Ok(entries) = fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
+    let Ok(entries) = fs::read_dir(root) else {
+        println!("❌ ERROR: could not open or find folder '{}'!", root);
+        println!("Make sure it sits next to the 'music_player' folder, not inside it.");
+        return playlists;
+    };
 
-            if path.is_dir() {
-                let name = path.file_name().unwrap().to_string_lossy().to_string();
-                let mut songs = vec![];
+    for entry in entries.flatten() {
+        let path = entry.path();
 
-                if let Ok(files) = fs::read_dir(&path) {
-                    for file in files.flatten() {
-                        let file_path = file.path();
-                        if file_path.extension().map_or(false, |ext| ext == "mp3") {
-                            songs.push(file_path.to_string_lossy().to_string());
-                        }
+        if path.is_dir() {
+            // A subfolder becomes a playlist named after the folder.
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let mut songs = vec![];
+
+            if let Ok(files) = fs::read_dir(&path) {
+                for file in files.flatten() {
+                    let file_path = file.path();
+                    if file_path.extension().is_some_and(|ext| ext == "mp3") {
+                        songs.push(file_path.to_string_lossy().to_string());
                     }
                 }
-
-                if !songs.is_empty() {
-                    println!("📁 Знайдено плейліст '{}' (пісен: {})", name, songs.len());
-                    playlists.push(Playlist { name, songs });
-                }
-            } else if path.is_file() && path.extension().map_or(false, |ext| ext == "mp3") {
-                root_songs.push(path.to_string_lossy().to_string());
             }
+
+            if !songs.is_empty() {
+                println!("📁 Found playlist '{}' ({} songs)", name, songs.len());
+                playlists.push(Playlist { name, songs });
+            }
+        } else if path.is_file() && path.extension().is_some_and(|ext| ext == "mp3") {
+            // A loose MP3 in the root folder.
+            root_songs.push(path.to_string_lossy().to_string());
         }
-    } else {
-        println!("❌ ПОМИЛКА: Не вдалося відкрити або знайти папку '{}'!", root);
-        println!("Перевірте, чи вона лежить поруч із папкою 'music_player', а не всередині неї.");
     }
 
     if !root_songs.is_empty() {
-        println!("🎵 Знайдено {} треків прямо в корені папки {}", root_songs.len(), root);
+        println!("🎵 Found {} tracks directly in '{}'", root_songs.len(), root);
         playlists.push(Playlist {
             name: "Усі треки".to_string(),
             songs: root_songs,
@@ -55,32 +80,34 @@ pub fn scan_music(root: &str) -> Vec<Playlist> {
     }
 
     if playlists.is_empty() {
-        println!("⚠️ УВАГА: Не знайдено жодного MP3-файлу у вказаному шляху.");
+        println!("⚠️ WARNING: no MP3 files found at the given path.");
     }
 
     playlists
 }
 
-use id3::{Tag, TagLike};
-
-// Структура для хранения одной строчки текста и её таймкода
+/// One timestamped line of lyrics.
 #[derive(Debug, Clone)]
 pub struct LyricLine {
-    pub time_ms: u32,   // Время появления строчки в миллисекундах
-    pub text: String,   // Сам текст
+    /// When this line appears, in milliseconds from the start of the track.
+    pub time_ms: u32,
+    /// The line's text.
+    pub text: String,
 }
 
-/// Пытается извлечь синхронизированный текст (SYLT) из MP3-файла.
+/// Tries to extract synchronized lyrics (the ID3 `SYLT` frame) from a file.
+///
+/// Returns `None` if the file has no tags or no synced-lyrics frame.
 pub fn get_synced_lyrics(file_path: &str) -> Option<Vec<LyricLine>> {
-    println!("🎤 Пытаемся достать текст из файла: {}", file_path);
-    
+    println!("🎤 Looking for embedded lyrics in: {}", file_path);
+
     let tag = match id3::Tag::read_from_path(file_path) {
         Ok(t) => {
-            println!("✅ Базовые теги в файле есть. Ищем караоке-текст (SYLT)...");
+            println!("✅ File has ID3 tags. Searching for karaoke lyrics (SYLT)...");
             t
-        },
+        }
         Err(e) => {
-            println!("❌ Ошибка чтения тегов или тегов нет вообще: {}", e);
+            println!("❌ Could not read tags (or none present): {}", e);
             return None;
         }
     };
@@ -90,21 +117,24 @@ pub fn get_synced_lyrics(file_path: &str) -> Option<Vec<LyricLine>> {
         found = true;
         let mut lines = Vec::new();
         for (time, text) in &sync_lyric.content {
-            lines.push(LyricLine { time_ms: *time, text: text.to_string() });
+            lines.push(LyricLine {
+                time_ms: *time,
+                text: text.to_string(),
+            });
         }
         if !lines.is_empty() {
-            println!("🎉 УРА! Синхронизированный текст найден!");
+            println!("🎉 Synchronized lyrics found!");
             return Some(lines);
         }
     }
 
     if !found {
-        println!("😔 В этом файле НЕТ синхронизированного текста (SYLT).");
+        println!("😔 This file has no synchronized lyrics (SYLT).");
     }
     None
 }
 
-// Структура для чтения ответа от базы данных
+/// Subset of the lrclib API response we care about.
 #[derive(Deserialize)]
 struct LrcResponse {
     duration: Option<f64>,
@@ -112,7 +142,12 @@ struct LrcResponse {
     synced_lyrics: Option<String>,
 }
 
-/// Достаём название, артиста и альбом из ID3-тегов.
+/// Reads `(title, artist, album)` from a file's ID3 tags, with sensible
+/// fallbacks for messy downloaded files.
+///
+/// If the title is empty, the file stem is used. A common pattern in downloaded
+/// music is a title of the form `"Artist - Track"` with a junk artist tag; when
+/// detected, the title is split so the real artist and track are recovered.
 fn read_track_meta(file_path: &str) -> (String, String, String) {
     let mut title = String::new();
     let mut artist = String::new();
@@ -124,7 +159,7 @@ fn read_track_meta(file_path: &str) -> (String, String, String) {
         album = tag.album().unwrap_or("").trim().to_string();
     }
 
-    // Если названия нет — берём имя файла без расширения
+    // No title tag: fall back to the file name without extension.
     if title.is_empty() {
         title = std::path::Path::new(file_path)
             .file_stem()
@@ -132,8 +167,7 @@ fn read_track_meta(file_path: &str) -> (String, String, String) {
             .unwrap_or_default();
     }
 
-    // Частый случай у скачанной музыки: в "названии" лежит "Артист - Трек",
-    // а в поле "артист" — мусор. Разбор названия надёжнее.
+    // Recover "Artist - Track" titles, which are more reliable than the tags.
     if let Some((a, t)) = title.split_once(" - ") {
         let (a, t) = (a.trim(), t.trim());
         if !a.is_empty() && !t.is_empty() {
@@ -145,23 +179,23 @@ fn read_track_meta(file_path: &str) -> (String, String, String) {
     (title, artist, album)
 }
 
-/// Ищет текст песни в интернете
-/// Ищет синхронизированный текст в интернете по тегам и длительности трека.
-/// Ищет синхронизированный текст в интернете, опрашивая источники по очереди.
+/// Searches online providers for synchronized lyrics matching the track.
+///
+/// Providers are queried in order and the first hit wins. `duration` (when
+/// known) sharpens matching so we do not grab lyrics for the wrong edit of a
+/// song. To add a provider, query it in the chain below.
 pub fn fetch_lyrics_from_internet(
     file_path: &str,
     duration: Option<std::time::Duration>,
 ) -> Option<Vec<LyricLine>> {
     let (title, artist, album) = read_track_meta(file_path);
     if title.is_empty() {
-        println!("❌ Не удалось определить название трека.");
+        println!("❌ Could not determine the track title.");
         return None;
     }
 
     let dur_secs = duration.map(|d| d.as_secs());
 
-    // Источники опрашиваются по порядку — берём первый, где нашёлся текст.
-    // Чтобы добавить новый источник, допиши ещё одну строчку.
     if let Some(l) = lrclib_lyrics(&title, &artist, &album, dur_secs) {
         return Some(l);
     }
@@ -169,22 +203,25 @@ pub fn fetch_lyrics_from_internet(
         return Some(l);
     }
 
-    println!("❌ Ни в одном источнике подходящий текст не найден.");
+    println!("❌ No matching lyrics found in any source.");
     None
 }
 
-/// Источник №1: lrclib.net (точный, синхронизированный текст).
+/// Provider #1: lrclib.net — accurate, well-synced lyrics.
+///
+/// Tries an exact `/api/get` lookup first (which honors duration within ±2s),
+/// then falls back to `/api/search` and picks the best result by duration.
 fn lrclib_lyrics(
     title: &str,
     artist: &str,
     album: &str,
     dur_secs: Option<u64>,
 ) -> Option<Vec<LyricLine>> {
-    println!("🌐 [lrclib] Ищем: артист='{}', трек='{}'", artist, title);
+    println!("🌐 [lrclib] Searching: artist='{}', track='{}'", artist, title);
 
     let client = Client::builder().user_agent("Elysium/1.0.2").build().ok()?;
 
-    // --- Способ 1: точное совпадение через /api/get (учитывает длительность ±2с) ---
+    // --- Strategy 1: exact match via /api/get (uses duration, ±2s). ---
     if !artist.is_empty() {
         if let Some(secs) = dur_secs {
             let dur_str = secs.to_string();
@@ -203,7 +240,7 @@ fn lrclib_lyrics(
                     if let Ok(rec) = r.json::<LrcResponse>() {
                         if let Some(s) = rec.synced_lyrics {
                             if !s.trim().is_empty() {
-                                println!("✅ [lrclib] Точное совпадение (api/get).");
+                                println!("✅ [lrclib] Exact match (api/get).");
                                 return parse_lrc_string(&s);
                             }
                         }
@@ -213,7 +250,7 @@ fn lrclib_lyrics(
         }
     }
 
-    // --- Способ 2: поиск по артисту+названию, выбираем по длительности ---
+    // --- Strategy 2: search by artist + title, choose the closest duration. ---
     let mut req = client
         .get("https://lrclib.net/api/search")
         .query(&[("track_name", title)]);
@@ -228,17 +265,19 @@ fn lrclib_lyrics(
         let has_synced = r
             .synced_lyrics
             .as_deref()
-            .map_or(false, |s| !s.trim().is_empty());
+            .is_some_and(|s| !s.trim().is_empty());
         if !has_synced {
             continue;
         }
         match (dur_secs, r.duration) {
+            // Both durations known: accept the first within 3 seconds.
             (Some(ours), Some(theirs)) => {
                 if (theirs - ours as f64).abs() <= 3.0 {
                     best = Some(r);
                     break;
                 }
             }
+            // Duration unknown on either side: keep the first synced result.
             _ => {
                 if best.is_none() {
                     best = Some(r);
@@ -249,16 +288,17 @@ fn lrclib_lyrics(
 
     if let Some(r) = best {
         if let Some(s) = &r.synced_lyrics {
-            println!("✅ [lrclib] Текст найден через поиск.");
+            println!("✅ [lrclib] Found via search.");
             return parse_lrc_string(s);
         }
     }
 
-    println!("❌ [lrclib] Не найдено.");
+    println!("❌ [lrclib] Not found.");
     None
 }
 
-// ---- Источник №2: NetEase Cloud Music ----
+// --- Provider #2: NetEase Cloud Music response types ---
+
 #[derive(Deserialize)]
 struct NeteaseSearch {
     result: Option<NeteaseResult>,
@@ -271,7 +311,8 @@ struct NeteaseResult {
 struct NeteaseSong {
     id: u64,
     name: Option<String>,
-    duration: Option<u64>, // длительность в МИЛЛИсекундах
+    /// Duration in MILLIseconds (NetEase's unit).
+    duration: Option<u64>,
 }
 #[derive(Deserialize)]
 struct NeteaseLyricResp {
@@ -282,34 +323,42 @@ struct NeteaseLrc {
     lyric: Option<String>,
 }
 
-/// Нормализуем строку для сравнения: нижний регистр, только буквы и цифры.
+/// Normalizes a string for fuzzy comparison: lowercase, letters and digits only.
 fn normalize(s: &str) -> String {
-    s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+    s.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
 }
 
-/// Похожи ли названия (одно содержит другое после нормализации).
+/// Returns `true` if two titles are "close enough": after normalization, one
+/// contains the other.
 fn titles_match(a: &str, b: &str) -> bool {
     let na = normalize(a);
     let nb = normalize(b);
     !na.is_empty() && !nb.is_empty() && (na.contains(&nb) || nb.contains(&na))
 }
 
-/// Источник №2: NetEase Cloud Music (огромный каталог, каверы, неанглоязычное).
+/// Provider #2: NetEase Cloud Music — huge catalog, good for covers and
+/// non-English songs.
+///
+/// NetEase is picky about headers, so we pose as a browser and set a `Referer`.
+/// A candidate is accepted only if its title is similar (and, when duration is
+/// known, within ±5 seconds), which filters out random matches.
 fn netease_lyrics(title: &str, artist: &str, dur_secs: Option<u64>) -> Option<Vec<LyricLine>> {
     let query = if artist.is_empty() {
         title.to_string()
     } else {
         format!("{} {}", artist, title)
     };
-    println!("🌐 [NetEase] Ищем: {}", query);
+    println!("🌐 [NetEase] Searching: {}", query);
 
-    // NetEase капризен к заголовкам — притворяемся браузером + ставим Referer.
     let client = Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
         .build()
         .ok()?;
 
-    // 1. Поиск трека → его id (type=1 — искать песни)
+    // 1. Search for the track to obtain its id (type=1 means "songs").
     let search: NeteaseSearch = client
         .get("https://music.163.com/api/search/get")
         .header("Referer", "https://music.163.com")
@@ -321,15 +370,14 @@ fn netease_lyrics(title: &str, artist: &str, dur_secs: Option<u64>) -> Option<Ve
 
     let songs = search.result?.songs?;
     if songs.is_empty() {
-        println!("❌ [NetEase] Трек не найден.");
+        println!("❌ [NetEase] Track not found.");
         return None;
     }
 
-    // Выбираем песню по длительности (NetEase отдаёт мс → делим на 1000), иначе первую.
-    // Берём песню, чьё НАЗВАНИЕ похоже на наше (отсекает случайные совпадения),
-    // а при известной длительности — ещё и близкую по времени (±5 c).
+    // Pick a song whose title is similar and (if we know our duration) close in
+    // length. NetEase reports milliseconds, so divide by 1000 to compare.
     let song = songs.iter().find(|s| {
-        let name_ok = s.name.as_deref().map_or(false, |n| titles_match(n, title));
+        let name_ok = s.name.as_deref().is_some_and(|n| titles_match(n, title));
         if !name_ok {
             return false;
         }
@@ -345,12 +393,12 @@ fn netease_lyrics(title: &str, artist: &str, dur_secs: Option<u64>) -> Option<Ve
     let song = match song {
         Some(s) => s,
         None => {
-            println!("❌ [NetEase] Похожий трек не найден (название/длительность не совпали).");
+            println!("❌ [NetEase] No similar track (title/duration mismatch).");
             return None;
         }
     };
 
-    // 2. Тянем текст по id
+    // 2. Fetch lyrics by song id.
     let id_str = song.id.to_string();
     let lyric: NeteaseLyricResp = client
         .get("https://music.163.com/api/song/lyric")
@@ -363,44 +411,68 @@ fn netease_lyrics(title: &str, artist: &str, dur_secs: Option<u64>) -> Option<Ve
 
     let lrc = lyric.lrc?.lyric?;
     if lrc.trim().is_empty() {
-        println!("😔 [NetEase] У трека нет синхротекста.");
+        println!("😔 [NetEase] Track has no synced lyrics.");
         return None;
     }
 
-    println!("✅ [NetEase] Текст найден!");
+    println!("✅ [NetEase] Lyrics found!");
     parse_lrc_string(&lrc)
 }
 
-/// Превращает сырой текст с таймкодами в готовые строчки для плеера
+/// Parses raw LRC text (lines like `[mm:ss.xx] text`) into timed [`LyricLine`]s.
+///
+/// Lines without a valid `[mm:ss]` timestamp are skipped. Fractional seconds
+/// are interpreted by length: 2 digits are centiseconds (×10), 1 digit is
+/// deciseconds (×100), 3+ digits are taken as milliseconds. Empty lines are
+/// kept as a single space so the lyrics view preserves spacing. Returns `None`
+/// when nothing parseable was found.
 pub fn parse_lrc_string(content: &str) -> Option<Vec<LyricLine>> {
     let mut lines = Vec::new();
     for line in content.lines() {
         let line = line.trim();
-        if line.starts_with('[') {
-            if let Some(close_idx) = line.find(']') {
-                let time_str = &line[1..close_idx];
-                let text = line[close_idx + 1..].trim().to_string();
-                
-                let parts: Vec<&str> = time_str.split(':').collect();
-                if parts.len() == 2 {
-                    let min: u32 = parts[0].parse().unwrap_or(0);
-                    let sec_parts: Vec<&str> = parts[1].split('.').collect();
-                    let sec: u32 = sec_parts[0].parse().unwrap_or(0);
-                    
-                    let ms: u32 = if sec_parts.len() > 1 {
-                        let ms_str = sec_parts[1];
-                        let ms_val: u32 = ms_str.parse().unwrap_or(0);
-                        if ms_str.len() == 2 { ms_val * 10 } 
-                        else if ms_str.len() == 1 { ms_val * 100 } 
-                        else { ms_val }
-                    } else { 0 };
-
-                    let time_ms = (min * 60 * 1000) + (sec * 1000) + ms;
-                    let display_text = if text.is_empty() { " ".to_string() } else { text };
-                    lines.push(LyricLine { time_ms, text: display_text });
-                }
-            }
+        if !line.starts_with('[') {
+            continue;
         }
+        let Some(close_idx) = line.find(']') else {
+            continue;
+        };
+
+        let time_str = &line[1..close_idx];
+        let text = line[close_idx + 1..].trim().to_string();
+
+        let parts: Vec<&str> = time_str.split(':').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+
+        let min: u32 = parts[0].parse().unwrap_or(0);
+        let sec_parts: Vec<&str> = parts[1].split('.').collect();
+        let sec: u32 = sec_parts[0].parse().unwrap_or(0);
+
+        let ms: u32 = if sec_parts.len() > 1 {
+            let ms_str = sec_parts[1];
+            let ms_val: u32 = ms_str.parse().unwrap_or(0);
+            match ms_str.len() {
+                2 => ms_val * 10,  // centiseconds
+                1 => ms_val * 100, // deciseconds
+                _ => ms_val,       // already milliseconds
+            }
+        } else {
+            0
+        };
+
+        let time_ms = (min * 60 * 1000) + (sec * 1000) + ms;
+        let display_text = if text.is_empty() {
+            " ".to_string()
+        } else {
+            text
+        };
+        lines.push(LyricLine { time_ms, text: display_text });
     }
-    if lines.is_empty() { None } else { Some(lines) }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines)
+    }
 }
